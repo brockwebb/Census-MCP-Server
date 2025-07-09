@@ -6,8 +6,8 @@ from pathlib import Path
 def extract_geography_weights():
     """Extract geography weights from complete enriched universe."""
     
-    input_file = "2023_ACS_Enriched_Universe_With_Category_Weights--dot13Threshold.json"
-    output_file = "../../data/geo_weights.json"
+    input_file = "2023_ACS_Enriched_Universe.json"
+    output_file = "../concepts/geo_similarity_scalars.json"
     
     print(f"📊 Reading complete weighted file: {input_file}")
     

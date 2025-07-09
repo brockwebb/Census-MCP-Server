@@ -2,6 +2,7 @@
 """
 concept_weight_extractor_parameterized.py
 Flexible configuration for different category sets and thresholds.
+Modified to support raw similarity output for geography scalars.
 """
 
 import json
@@ -23,13 +24,9 @@ from datetime import datetime
 # No Geography Configuration (7 categories, geography excluded)
 NO_GEOGRAPHY_CATEGORIES = [
     'core_demographics',
-    'economics_1_industry',
-    'economics_2_income',
-    'education_1_degree',
-    'education_2_education',
-    'education_3_educational',
-    'education_4_school',
-    'education_5_enrollment',
+    'economics',
+    'education',
+    # 'geography',  # REMOVED for Step 0
     'health_social',
     'housing',
     'specialized_populations',
@@ -65,7 +62,7 @@ DEMOGRAPHICS_INDEPENDENT = [
 ]
 
 # Model and processing parameters
-DEFAULT_MODEL = 'sentence-transformers/all-roberta-large-v1'
+DEFAULT_MODEL = 'BAAI/bge-large-en-v1.5'
 STEP0_THRESHOLD = 0.09  # For 12 categories (1/12 = 8.3% + buffer)
 ORIGINAL_THRESHOLD = 0.05  # Original threshold
 DEFAULT_BATCH_SIZE = 100
@@ -81,28 +78,29 @@ SIMPLIFIED_OUTPUT = False  # If True, output only category_weights field
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class CategoryWeightExtractor:
+class ConceptWeightExtractor:
     def __init__(self,
-                 ontology_file: str,
-                 universe_file: str,
-                 output_file: str = None,
-                 categories: List[str] = None,
+                 categories_config: Dict[str, List[str]],
+                 threshold: float = STEP0_THRESHOLD,
                  model_name: str = DEFAULT_MODEL,
-                 weight_threshold: float = STEP0_THRESHOLD,
-                 batch_size: int = DEFAULT_BATCH_SIZE,
-                 embed_batch_size: int = DEFAULT_EMBED_BATCH_SIZE):
+                 embed_batch_size: int = DEFAULT_EMBED_BATCH_SIZE,
+                 checkpoint_batch_size: int = DEFAULT_BATCH_SIZE,
+                 simplified_output: bool = SIMPLIFIED_OUTPUT):
         
-        self.ontology_file = ontology_file
-        self.universe_file = universe_file
-        self.output_file = output_file or "2023_ACS_Enriched_Universe_With_Category_Weights.json"
-        self.batch_size = batch_size  # Checkpoint batch size
-        self.embed_batch_size = embed_batch_size  # Embedding batch size
-        self.checkpoint_file = f"{Path(self.output_file).stem}_checkpoint.json"
-        self.weight_threshold = weight_threshold
-        
-        # Use provided categories or default to no-geography config
-        self.categories = categories or NO_GEOGRAPHY_CATEGORIES
+        self.categories = categories_config['categories']
+        self.threshold = threshold
         self.model_name = model_name
+        self.embed_batch_size = embed_batch_size
+        self.checkpoint_batch_size = checkpoint_batch_size
+        self.simplified_output = simplified_output
+        self.raw_scalars = False  # Will be set by main()
+        
+        # Generate cache-friendly identifiers
+        categories_str = '_'.join(sorted(self.categories))
+        threshold_str = f"thresh{str(threshold).replace('.', 'p')}"
+        model_str = model_name.replace('/', '_').replace('-', '_')
+        
+        self.cache_id = f"{categories_str}_{threshold_str}_{model_str}"
         
         # Load model
         logger.info(f"Loading sentence transformer model: {self.model_name}")
@@ -113,16 +111,14 @@ class CategoryWeightExtractor:
         self.category_concepts = self._load_and_group_concepts()
         self.category_embeddings = self._get_category_embeddings()
         
-        # Load universe data
-        self.universe_data = self._load_universe_data()
-        
-        logger.info(f"Loaded {len(self.categories)} categories and {len(self.universe_data)} variables")
-        logger.info(f"Categories: {', '.join(self.categories)}")
-        logger.info(f"Weight threshold: {self.weight_threshold}")
+        logger.info(f"Loaded {len(self.categories)} categories")
+        for cat in self.categories:
+            count = len(self.category_concepts.get(cat, []))
+            logger.info(f"  {cat}: {count} concepts")
     
     def _load_and_group_concepts(self) -> Dict[str, List[Dict]]:
         """Load concepts and group by category"""
-        with open(self.ontology_file, 'r') as f:
+        with open("COOS_Complete_Ontology.json", 'r') as f:
             ontology = json.load(f)
         
         # Group concepts by category
@@ -139,10 +135,6 @@ class CategoryWeightExtractor:
             category = concept.get('category', '').lower()
             if category in category_concepts:
                 category_concepts[category].append(concept)
-        
-        # Log category sizes
-        for cat, concepts in category_concepts.items():
-            logger.info(f"  {cat}: {len(concepts)} concepts")
         
         return category_concepts
     
@@ -167,486 +159,370 @@ class CategoryWeightExtractor:
                 category_texts.append(concept_text)
             
             # Create comprehensive category text by combining all concepts
-            combined_category_text = ' || '.join(category_texts)
+            combined_category_text = ' | '.join(category_texts)
             
             # Generate embedding for this category
-            category_embedding = self.model.encode([combined_category_text])
-            category_embeddings[category] = category_embedding[0]
+            category_embedding = self.model.encode([combined_category_text], show_progress_bar=False)[0]
+            category_embeddings[category] = category_embedding
             
-            logger.info(f"Generated embedding for {category} ({len(concepts)} concepts)")
-        
+        logger.info(f"Generated embeddings for {len(category_embeddings)} categories")
         return category_embeddings
     
     def _load_universe_data(self) -> List[Dict]:
-        """Load and normalize universe data structure"""
-        with open(self.universe_file, 'r') as f:
-            universe_data = json.load(f)
+        """Load enriched universe data"""
+        with open("2023_ACS_Enriched_Universe.json", 'r') as f:
+            data = json.load(f)
         
-        # Handle both formats: direct array or metadata wrapper
-        if isinstance(universe_data, list):
-            return universe_data
-        elif isinstance(universe_data, dict):
-            # Check for 'variables' key (consolidated format)
-            if 'variables' in universe_data:
-                variables_data = universe_data['variables']
-                if isinstance(variables_data, list):
-                    return variables_data
-                elif isinstance(variables_data, dict):
-                    # Convert dict of variables to list, preserving variable names
-                    result = []
-                    for var_name, var_data in variables_data.items():
-                        var_record = var_data.copy()
-                        # Ensure the variable has a name field
-                        if 'name' not in var_record:
-                            var_record['name'] = var_name
-                        if 'variable_id' not in var_record:
-                            var_record['variable_id'] = var_name
-                        result.append(var_record)
-                    return result
-                else:
-                    raise ValueError(f"'variables' key contains unexpected type: {type(variables_data)}")
-            else:
-                raise ValueError(f"Unknown universe file format. Keys: {list(universe_data.keys())[:10]}")
-        else:
-            raise ValueError(f"Unexpected universe file format: {type(universe_data)}")
-    
-    def _extract_analysis_text_batch(self, variables: List[Dict]) -> List[str]:
-        """Extract analysis text from batch of variables"""
-        analysis_texts = []
+        variables = data.get('variables', {})
         
-        for variable in variables:
-            text_parts = []
-            
-            # Get enrichment analysis
-            enrichment = variable.get('enrichment', {})
-            if enrichment.get('analysis'):
-                text_parts.append(enrichment.get('analysis'))
-            
-            if enrichment.get('methodology_notes'):
-                text_parts.append(enrichment.get('methodology_notes'))
-            
-            if enrichment.get('statistical_notes'):
-                text_parts.append(enrichment.get('statistical_notes'))
-            
-            # Get enrichment_text field (from your data structure)
-            if variable.get('enrichment_text'):
-                text_parts.append(variable.get('enrichment_text'))
-            
-            # Get basic variable info
-            if variable.get('label'):
-                text_parts.append(variable.get('label'))
-            
-            if variable.get('concept'):
-                text_parts.append(variable.get('concept'))
-            
-            # Convert all parts to strings and filter out None/empty values
-            clean_text_parts = [str(part) for part in text_parts if part is not None and str(part).strip()]
-            analysis_text = ' | '.join(clean_text_parts) if clean_text_parts else ""
-            analysis_texts.append(analysis_text)
-        
-        return analysis_texts
-    
-    def _compute_category_weights_batch(
-            self,
-            analysis_texts: List[str]
-    ) -> Tuple[List[Dict[str, float]], List[Dict[str, float]]]:
-        """
-        For a batch of variable-level texts:
-        • produce two parallel lists:
-            1. linear-normalised category weights
-            2. log-normalised ("winner-takes-most") weights
-        Each element i of both lists corresponds to analysis_texts[i].
-        Empty / whitespace texts yield empty dicts in both lists.
-        """
-        # ---- 1. collect only non-empty texts ----
-        valid_texts, valid_idx = [], []
-        for idx, txt in enumerate(analysis_texts):
-            if txt.strip():
-                valid_texts.append(txt)
-                valid_idx.append(idx)
-
-        # Pre-fill results with empty dicts (for the blanks we skipped)
-        linear_out = [{} for _ in analysis_texts]
-        log_out    = [{} for _ in analysis_texts]
-
-        if not valid_texts:          # nothing to do
-            return linear_out, log_out
-
-        # ---- 2. embeddings  ----
-        text_embs = self.model.encode(
-            valid_texts,
-            show_progress_bar=False,
-            batch_size=self.embed_batch_size
-        )
-
-        cat_emb_mat = np.stack([self.category_embeddings[c] for c in self.categories])
-        sims_batch  = cosine_similarity(text_embs, cat_emb_mat)   # shape: (batch, num_categories)
-
-        # ---- 3. turn similarities into weights ----
-        eps = 1e-8
-        for row_idx, sims in enumerate(sims_batch):
-            # a) clip negatives (cosine can be −1…1)
-            sims = np.clip(sims, 0, None)
-
-            # b) linear weights --------------------------------------------------
-            lin = sims / (sims.sum() + eps)                  # normalise to 1
-            lin = {cat: float(w) for cat, w in zip(self.categories, lin)}
-            lin = {k: v for k, v in lin.items() if v >= self.weight_threshold}
-            if not lin:                                      # make sure ≥1 cat
-                best = int(np.argmax(sims))
-                lin = {self.categories[best]: 1.0}
-            else:
-                tot = sum(lin.values())
-                lin = {k: v / tot for k, v in lin.items()}
-
-            # c) log-weights -----------------------------------------------------
-            logw = np.log1p(sims)                            # log(1+v)
-            logw = logw / (logw.sum() + eps)
-            logw = {cat: float(w) for cat, w in zip(self.categories, logw)}
-            logw = {k: v for k, v in logw.items() if v >= self.weight_threshold}
-            if not logw:
-                best = int(np.argmax(sims))
-                logw = {self.categories[best]: 1.0}
-            else:
-                tot = sum(logw.values())
-                logw = {k: v / tot for k, v in logw.items()}
-
-            # d) write back in the right slot
-            original_idx = valid_idx[row_idx]
-            linear_out[original_idx] = lin
-            log_out[original_idx]    = logw
-
-        return linear_out, log_out
-    
-    def _load_checkpoint(self) -> Tuple[int, List[Dict]]:
-        """Load checkpoint if exists"""
-        if Path(self.checkpoint_file).exists():
-            try:
-                with open(self.checkpoint_file, 'r') as f:
-                    checkpoint = json.load(f)
-                
-                last_processed = checkpoint.get('last_processed_index', -1)
-                processed_variables = checkpoint.get('processed_variables', [])
-                
-                logger.info(f"📂 Resuming from checkpoint: {last_processed + 1:,}/{len(self.universe_data):,} variables")
-                return last_processed, processed_variables
-                
-            except Exception as e:
-                logger.warning(f"Error loading checkpoint: {e}")
-                return -1, []
-        
-        return -1, []
-    
-    def _save_checkpoint(self, last_processed_index: int, processed_variables: List[Dict]):
-        """Save checkpoint"""
-        checkpoint = {
-            'last_processed_index': last_processed_index,
-            'processed_variables': processed_variables,
-            'timestamp': datetime.now().isoformat(),
-            'total_variables': len(self.universe_data),
-            'categories': self.categories,
-            'weight_threshold': self.weight_threshold,
-            'model_name': self.model_name
-        }
-        
-        with open(self.checkpoint_file, 'w') as f:
-            json.dump(checkpoint, f, indent=2)
-    
-    def _save_final_results(self, processed_variables: List[Dict]):
-        """Save final enriched universe with category weights"""
-        
-        # Check if output file already exists
-        if Path(self.output_file).exists():
-            # Create timestamped backup
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_file = f"{Path(self.output_file).stem}_backup_{timestamp}.json"
-            logger.info(f"📁 Output file exists, creating backup: {backup_file}")
-            Path(self.output_file).rename(backup_file)
-        
-        # Prepare final results
-        if SIMPLIFIED_OUTPUT:
-            # Simplified format: just variable_id -> category_weights
-            simple_weights = {}
-            for var in processed_variables:
-                var_id = var.get('variable_id', var.get('name', 'unknown'))
-                weights = var.get('category_weights_linear', {})
-                if weights:
-                    simple_weights[var_id] = weights
-            
-            with open(self.output_file, 'w') as f:
-                json.dump(simple_weights, f, indent=2)
-                
-        else:
-            # Full format with metadata
-            final_results = {
-                'metadata': {
-                    'created_at': datetime.now().isoformat(),
-                    'source_universe_file': self.universe_file,
-                    'source_ontology_file': self.ontology_file,
-                    'sentence_transformer_model': self.model_name,
-                    'total_variables': len(processed_variables),
-                    'categories': self.categories,
-                    'processing_batch_size': self.batch_size,
-                    'embed_batch_size': self.embed_batch_size,
-                    'weight_threshold': self.weight_threshold,
-                    'weight_approach': f'{len(self.categories)}_category_dual_normalization',
-                    'geography_included': 'geography' in self.categories,
-                    'keep_log_weights': KEEP_LOG_WEIGHTS
-                },
-                'variables': processed_variables
+        # Convert to list format for processing
+        universe_list = []
+        for var_id, var_data in variables.items():
+            var_entry = {
+                'variable_id': var_id,
+                **var_data
             }
+            universe_list.append(var_entry)
+        
+        logger.info(f"Loaded {len(universe_list)} variables from universe")
+        return universe_list
+    
+    def _get_analysis_text(self, variable: Dict[str, Any]) -> str:
+        """Extract analysis text from variable data - same as working extractor"""
+        # Check for enrichment_text field first (from consolidated universe)
+        if variable.get('enrichment_text'):
+            return variable.get('enrichment_text')
+        
+        # Check for concept field
+        if variable.get('concept'):
+            return variable.get('concept')
+        
+        # Check for label field
+        if variable.get('label'):
+            return variable.get('label')
+        
+        # Check nested enrichment structure (fallback)
+        enrichment = variable.get('enrichment', {})
+        if enrichment.get('analysis'):
+            return enrichment.get('analysis')
+        
+        if enrichment.get('enhanced_description'):
+            return enrichment.get('enhanced_description')
+        
+        # Legacy nested analysis structures
+        for analysis_key in ['coos_analysis', 'bulk_analysis', 'early_analysis']:
+            if analysis_key in variable:
+                analysis = variable[analysis_key]
+                if isinstance(analysis, dict) and 'enhanced_description' in analysis:
+                    return analysis['enhanced_description']
+        
+        # Fallback to original description
+        return variable.get('description', '')
+    
+    def _compute_category_weights_batch(self, analysis_texts: List[str]) -> Tuple[List[Dict[str, float]], List[Dict[str, float]]]:
+        """Compute category weights for batch of analysis texts - returns both linear and log weights"""
+        # Filter out empty texts and track indices
+        valid_texts = []
+        valid_indices = []
+        for i, text in enumerate(analysis_texts):
+            if text.strip():
+                valid_texts.append(text)
+                valid_indices.append(i)
+        
+        if not valid_texts:
+            return [{} for _ in analysis_texts], [{} for _ in analysis_texts]
+        
+        # Generate embeddings for valid texts
+        text_embeddings = self.model.encode(valid_texts, show_progress_bar=False, batch_size=self.embed_batch_size)
+        
+        # Create matrix of category embeddings
+        category_embedding_matrix = np.array([self.category_embeddings[cat] for cat in self.categories])
+        
+        # Compute cosine similarities (batch operation)
+        similarities_batch = cosine_similarity(text_embeddings, category_embedding_matrix)
+        
+        # Process results for both linear and log weights
+        all_linear_weights = []
+        all_log_weights = []
+        valid_idx = 0
+        
+        for i in range(len(analysis_texts)):
+            if i in valid_indices:
+                similarities = similarities_batch[valid_idx]
+                
+                # Create raw weights dictionary with categories
+                raw_weights = {}
+                for j, category in enumerate(self.categories):
+                    similarity = float(similarities[j])
+                    raw_weights[category] = similarity
+                
+                # Process linear weights (standard normalization)
+                linear_weights = self._process_weights_linear(raw_weights)
+                all_linear_weights.append(linear_weights)
+                
+                # Process log weights (log normalization for winner-takes-most)
+                log_weights = self._process_weights_log(raw_weights)
+                all_log_weights.append(log_weights)
+                
+                valid_idx += 1
+            else:
+                all_linear_weights.append({})
+                all_log_weights.append({})
+        
+        return all_linear_weights, all_log_weights
+    
+    def _process_weights_linear(self, raw_weights: Dict[str, float]) -> Dict[str, float]:
+        """Process weights with linear normalization"""
+        if not raw_weights:
+            return {}
+        
+        # NEW: If raw scalars requested, skip normalization
+        if hasattr(self, 'raw_scalars') and self.raw_scalars:
+            return raw_weights
             
-            with open(self.output_file, 'w') as f:
-                json.dump(final_results, f, indent=2)
-        
-        logger.info(f"✅ Final results saved to: {self.output_file}")
-        
-        # Clean up checkpoint
-        if Path(self.checkpoint_file).exists():
-            Path(self.checkpoint_file).unlink()
+        # Normalize weights to sum to 1.0
+        total_weight = sum(raw_weights.values())
+        if total_weight > 0:
+            weights = {k: v/total_weight for k, v in raw_weights.items()}
+            
+            # Apply threshold - remove weights below threshold
+            filtered_weights = {k: v for k, v in weights.items() if v >= self.threshold}
+            
+            # Renormalize after filtering
+            if filtered_weights:
+                total_filtered = sum(filtered_weights.values())
+                return {k: v/total_filtered for k, v in filtered_weights.items()}
+            else:
+                # If all weights below threshold, keep the highest one
+                max_category = max(weights.keys(), key=lambda k: weights[k])
+                return {max_category: 1.0}
+        else:
+            return {}
     
-    def _progress_update(self, current: int, total: int, batch_stats: Dict = None):
-        """Update progress on same line"""
-        percentage = (current / total) * 100
-        progress_bar = "█" * int(percentage / 5) + "░" * (20 - int(percentage / 5))
+    def _process_weights_log(self, raw_weights: Dict[str, float]) -> Dict[str, float]:
+        """Process weights with log normalization for winner-takes-most effect"""
+        if not raw_weights:
+            return {}
         
-        stats_str = ""
-        if batch_stats:
-            avg_categories = batch_stats.get('avg_categories_linear', 0)
-            max_categories = batch_stats.get('max_categories', 0)
-            zero_categories = batch_stats.get('zero_categories', 0)
-            stats_str = f" | Avg: {avg_categories:.1f} | Max: {max_categories} | Zero: {zero_categories}"
+        # NEW: If raw scalars requested, skip normalization
+        if hasattr(self, 'raw_scalars') and self.raw_scalars:
+            return raw_weights
         
-        # Use \r to overwrite the same line
-        print(f"\r🔄 [{progress_bar}] {current:,}/{total:,} ({percentage:.1f}%){stats_str}", end='', flush=True)
+        # Apply log transformation to emphasize stronger categories
+        # Add small epsilon to avoid log(0)
+        epsilon = 1e-8
+        log_weights = {}
+        for k, v in raw_weights.items():
+            # Apply log(1 + weight) to preserve ordering while emphasizing differences
+            log_weights[k] = np.log(1 + max(v, epsilon))
+        
+        # Normalize log weights to sum to 1.0
+        total_log_weight = sum(log_weights.values())
+        if total_log_weight > 0:
+            normalized_log_weights = {k: v/total_log_weight for k, v in log_weights.items()}
+            
+            # Apply threshold - remove weights below threshold
+            filtered_log_weights = {k: v for k, v in normalized_log_weights.items() if v >= self.threshold}
+            
+            # Renormalize after filtering
+            if filtered_log_weights:
+                total_filtered = sum(filtered_log_weights.values())
+                return {k: v/total_filtered for k, v in filtered_log_weights.items()}
+            else:
+                # If all weights below threshold, keep the highest one
+                max_category = max(normalized_log_weights.keys(), key=lambda k: normalized_log_weights[k])
+                return {max_category: 1.0}
+        else:
+            return {}
     
-    def extract_weights(self):
-        """Main extraction process with optimized batch processing"""
-        
-        # Load checkpoint if exists
-        last_processed_index, processed_variables = self._load_checkpoint()
-        start_index = last_processed_index + 1
-        
-        # Initialize processed_variables as a dict for efficient lookups if resuming
-        processed_dict = {var.get('name', var.get('variable_id', f'var_{i}')): var
-                         for i, var in enumerate(processed_variables)}
-        
-        total_variables = len(self.universe_data)
-        remaining = total_variables - start_index
-        
-        logger.info(f"🎯 Starting category weight extraction from index {start_index:,}")
-        logger.info(f"📊 Processing {remaining:,} remaining variables in batches of {self.embed_batch_size}")
-        logger.info(f"🎛️  Weight threshold: {self.weight_threshold}")
+    def extract_weights(self, universe_data: List[Dict]) -> List[Dict]:
+        """Extract category weights from universe data with checkpointing"""
+        total_variables = len(universe_data)
+        logger.info(f"🚀 Starting category weight extraction...")
+        logger.info(f"📊 Processing {total_variables:,} variables in batches of {self.embed_batch_size}")
+        logger.info(f"🎯 Weight threshold: {self.threshold}")
         logger.info(f"🏷️  Categories ({len(self.categories)}): {', '.join(self.categories)}")
         
-        # Process in batches
-        for batch_start in range(start_index, total_variables, self.embed_batch_size):
-            batch_end = min(batch_start + self.embed_batch_size, total_variables)
-            batch_variables = self.universe_data[batch_start:batch_end]
-            
-            # Skip already processed variables
-            new_batch_variables = []
-            new_batch_indices = []
-            for i, variable in enumerate(batch_variables):
-                variable_name = variable.get('name') or variable.get('variable_id', f'var_{batch_start + i}')
-                if variable_name not in processed_dict:
-                    new_batch_variables.append(variable)
-                    new_batch_indices.append(batch_start + i)
-            
-            if not new_batch_variables:
-                # Update progress and continue
-                self._progress_update(batch_end, total_variables)
-                continue
+        results = []
+        start_time = time.time()
+        
+        for i in range(0, total_variables, self.embed_batch_size):
+            batch_end = min(i + self.embed_batch_size, total_variables)
+            batch = universe_data[i:batch_end]
             
             # Extract analysis texts for batch
-            analysis_texts = self._extract_analysis_text_batch(new_batch_variables)
+            analysis_texts = [self._get_analysis_text(var) for var in batch]
             
-            # Compute category weights for batch (vectorized) - returns both linear and log
+            # Compute weights for batch
             linear_weights_batch, log_weights_batch = self._compute_category_weights_batch(analysis_texts)
             
-            # Add weights to variables
-            batch_stats = {'linear_category_counts': [], 'log_category_counts': []}
-            for i, (variable, linear_weights, log_weights) in enumerate(zip(new_batch_variables, linear_weights_batch, log_weights_batch)):
-                enriched_variable = variable.copy()
-                enriched_variable['category_weights_linear'] = linear_weights
+            # Process batch results
+            for j, variable in enumerate(batch):
+                linear_weights = linear_weights_batch[j]
+                log_weights = log_weights_batch[j]
                 
-                # Keep log weights if configured
-                if KEEP_LOG_WEIGHTS:
-                    enriched_variable['category_weights_log'] = log_weights
-                
-                # For Step 0 simplified output, also add the main field
-                if SIMPLIFIED_OUTPUT:
-                    enriched_variable['category_weights'] = linear_weights
-                
-                enriched_variable['category_weights_metadata'] = {
-                    'extracted_at': datetime.now().isoformat(),
-                    'num_categories_linear': len(linear_weights),
-                    'num_categories_log': len(log_weights) if KEEP_LOG_WEIGHTS else 0,
-                    'max_weight_linear': max(linear_weights.values()) if linear_weights else 0.0,
-                    'max_weight_log': max(log_weights.values()) if log_weights and KEEP_LOG_WEIGHTS else 0.0,
-                    'weight_threshold': self.weight_threshold,
-                    'weight_approach': f'{len(self.categories)}_category_dual_normalization',
-                    'categories_used': self.categories,
-                    'model_used': self.model_name
-                }
-                
-                # Add to processed list
-                processed_variables.append(enriched_variable)
-                variable_name = variable.get('name') or variable.get('variable_id', f'var_{new_batch_indices[i]}')
-                processed_dict[variable_name] = enriched_variable
-                
-                # Track stats for both weight types
-                batch_stats['linear_category_counts'].append(len(linear_weights))
-                if KEEP_LOG_WEIGHTS:
-                    batch_stats['log_category_counts'].append(len(log_weights))
+                if self.simplified_output:
+                    # Simple output format - just category weights
+                    results.append({
+                        'variable_id': variable['variable_id'],
+                        'category_weights': linear_weights
+                    })
+                else:
+                    # Full output format with both weight types
+                    results.append({
+                        'variable_id': variable['variable_id'],
+                        'category_weights_linear': linear_weights,
+                        'category_weights_log': log_weights if KEEP_LOG_WEIGHTS else None
+                    })
             
-            # Calculate batch statistics
-            if batch_stats['linear_category_counts']:
-                batch_stats['avg_categories_linear'] = np.mean(batch_stats['linear_category_counts'])
-                if KEEP_LOG_WEIGHTS:
-                    batch_stats['avg_categories_log'] = np.mean(batch_stats['log_category_counts'])
-                batch_stats['max_categories'] = max(batch_stats['linear_category_counts'])
-                batch_stats['zero_categories'] = sum(1 for c in batch_stats['linear_category_counts'] if c == 0)
-            
-            # Update progress
-            self._progress_update(batch_end, total_variables, batch_stats)
-            
-            # Save checkpoint every batch_size variables
-            if (batch_end - start_index) % self.batch_size == 0:
-                self._save_checkpoint(batch_end - 1, processed_variables)
+            # Progress update
+            self._progress_update(batch_end, total_variables)
         
-        # Final newline after progress updates
-        print()
+        elapsed_time = time.time() - start_time
+        logger.info(f"\n🎉 Extraction complete! Processed {total_variables:,} variables")
+        logger.info(f"⏱️  Total processing time: {elapsed_time:.2f} seconds")
         
-        # Save final results
-        logger.info(f"🎉 Extraction complete! Processed {len(processed_variables):,} variables")
-        self._save_final_results(processed_variables)
-        
-        # Print summary statistics
-        self._print_summary_stats(processed_variables)
+        return results
     
-    def _print_summary_stats(self, processed_variables: List[Dict]):
-        """Print summary statistics for both weight types"""
-        linear_counts = [len(var.get('category_weights_linear', {})) for var in processed_variables]
-        linear_max_weights = [var.get('category_weights_metadata', {}).get('max_weight_linear', 0) for var in processed_variables]
-        
-        logger.info(f"\n📊 EXTRACTION SUMMARY ({len(self.categories)} CATEGORIES):")
-        logger.info(f"   Total variables processed: {len(processed_variables):,}")
-        logger.info(f"   Categories used: {', '.join(self.categories)}")
-        logger.info(f"   LINEAR WEIGHTS:")
-        logger.info(f"     Avg categories per variable: {np.mean(linear_counts):.2f}")
-        logger.info(f"     Max categories per variable: {max(linear_counts) if linear_counts else 0}")
-        logger.info(f"     Variables with 0 categories: {sum(1 for c in linear_counts if c == 0):,}")
-        logger.info(f"     Avg max weight per variable: {np.mean(linear_max_weights):.3f}")
-        
-        if KEEP_LOG_WEIGHTS:
-            log_counts = [len(var.get('category_weights_log', {})) for var in processed_variables]
-            log_max_weights = [var.get('category_weights_metadata', {}).get('max_weight_log', 0) for var in processed_variables]
-            logger.info(f"   LOG WEIGHTS:")
-            logger.info(f"     Avg categories per variable: {np.mean(log_counts):.2f}")
-            logger.info(f"     Max categories per variable: {max(log_counts) if log_counts else 0}")
-            logger.info(f"     Variables with 0 categories: {sum(1 for c in log_counts if c == 0):,}")
-            logger.info(f"     Avg max weight per variable: {np.mean(log_max_weights):.3f}")
-        
-        logger.info(f"   Weight threshold applied: {self.weight_threshold}")
-        
-        # Category frequency analysis
-        linear_frequency = {}
-        linear_total_weights = {}
-        
-        for var in processed_variables:
-            # Linear weights
-            for category, weight in var.get('category_weights_linear', {}).items():
-                linear_frequency[category] = linear_frequency.get(category, 0) + 1
-                linear_total_weights[category] = linear_total_weights.get(category, 0) + weight
-        
-        if linear_frequency:
-            logger.info(f"\n🏷️  CATEGORY DISTRIBUTION:")
-            sorted_linear = sorted(linear_frequency.items(), key=lambda x: x[1], reverse=True)
-            for category, count in sorted_linear:
-                avg_weight = linear_total_weights[category] / count if count > 0 else 0
-                percentage = (count / len(processed_variables)) * 100
-                logger.info(f"   {category}: {count:,} variables ({percentage:.1f}%) | Avg weight: {avg_weight:.3f}")
+    def _progress_update(self, current: int, total: int):
+        """Update progress on same line"""
+        if current == total:
+            # Final update
+            print(f"\r🔄 [{current:,}/{total:,}] (100.0%) | ✅ COMPLETE")
+        else:
+            percent = (current / total) * 100
+            bar_length = 20
+            filled_length = int(bar_length * current // total)
+            bar = '█' * filled_length + '-' * (bar_length - filled_length)
+            print(f"\r🔄 [{bar}] {current:,}/{total:,} ({percent:.1f}%)", end='', flush=True)
+
+def get_categories_config(categories_name: str) -> Dict[str, Any]:
+    """Get categories configuration by name"""
+    configs = {
+        'no_geography': {
+            'categories': NO_GEOGRAPHY_CATEGORIES,
+            'description': '7 categories (geography excluded)'
+        },
+        'geography_only': {
+            'categories': GEOGRAPHY_ONLY_CATEGORIES,
+            'description': '1 category (geography only)'
+        },
+        'original': {
+            'categories': ORIGINAL_8_CATEGORIES,
+            'description': '8 categories (original set)'
+        },
+        'demographics_independent': {
+            'categories': DEMOGRAPHICS_INDEPENDENT,
+            'description': '8 categories (demographics split)'
+        }
+    }
+    
+    if categories_name not in configs:
+        raise ValueError(f"Unknown categories config: {categories_name}. Available: {list(configs.keys())}")
+    
+    return configs[categories_name]
+
+def generate_output_filename(categories_config: Dict, threshold: float, model_name: str) -> str:
+    """Generate descriptive output filename"""
+    # Clean up category name
+    category_count = len(categories_config['categories'])
+    
+    # Determine category set name
+    if set(categories_config['categories']) == set(NO_GEOGRAPHY_CATEGORIES):
+        cat_name = f"{category_count}cat_nogeo"
+    elif set(categories_config['categories']) == set(GEOGRAPHY_ONLY_CATEGORIES):
+        cat_name = "1cat_geo_only"
+    elif set(categories_config['categories']) == set(ORIGINAL_8_CATEGORIES):
+        cat_name = f"{category_count}cat_original"
+    else:
+        cat_name = f"{category_count}cat_custom"
+    
+    # Clean up threshold and model name
+    threshold_str = f"thresh{str(threshold).replace('.', 'p')}"
+    model_str = model_name.replace('/', '_').replace('-', '_')
+    
+    return f"2023_ACS_Enriched_Universe_{cat_name}_{threshold_str}_{model_str}.json"
 
 def main():
-    parser = argparse.ArgumentParser(description='Extract category weights from enriched universe using parameterized semantic similarity')
-    parser.add_argument('--ontology-file', default='COOS_Complete_Ontology.json', help='Path to unified ontology file (default: COOS_Complete_Ontology.json)')
-    parser.add_argument('--universe-file', default='2023_ACS_Enriched_Universe.json', help='Path to enriched universe file (default: 2023_ACS_Enriched_Universe.json)')
-    parser.add_argument('--output', help='Output file path (default: auto-generated based on config)')
-    parser.add_argument('--categories', choices=['no_geography', 'original', 'demo_independent', 'geography_only'], default='no_geography',
-                        help='Category set to use (default: no_geography - 12 categories after edu/econ split)')
-    parser.add_argument('--model', default=DEFAULT_MODEL, help=f'Sentence transformer model (default: {DEFAULT_MODEL})')
-    parser.add_argument('--threshold', type=float, default=STEP0_THRESHOLD, help=f'Minimum weight threshold (default: {STEP0_THRESHOLD})')
-    parser.add_argument('--batch-size', type=int, default=DEFAULT_BATCH_SIZE, help='Checkpoint batch size (default: 100)')
-    parser.add_argument('--embed-batch-size', type=int, default=DEFAULT_EMBED_BATCH_SIZE, help='Embedding batch size (default: 50)')
-    parser.add_argument('--simplified', action='store_true', help='Output simplified format (variable_id -> weights only)')
+    parser = argparse.ArgumentParser(description='Extract concept weights from ACS variables')
+    parser.add_argument('--categories', default='no_geography',
+                       choices=['no_geography', 'geography_only', 'original', 'demographics_independent'],
+                       help='Category configuration to use')
+    parser.add_argument('--threshold', type=float, default=STEP0_THRESHOLD,
+                       help='Minimum weight threshold (default: 0.09)')
+    parser.add_argument('--model', default=DEFAULT_MODEL,
+                       help='Sentence transformer model to use')
+    parser.add_argument('--embed-batch-size', type=int, default=DEFAULT_EMBED_BATCH_SIZE,
+                       help='Batch size for embedding generation')
+    parser.add_argument('--checkpoint-batch-size', type=int, default=DEFAULT_BATCH_SIZE,
+                       help='Batch size for checkpointing')
+    parser.add_argument('--output', help='Output filename (auto-generated if not specified)')
+    parser.add_argument('--simplified-output', action='store_true',
+                       help='Output only category_weights field (no log weights)')
+    parser.add_argument('--raw-scalars', action='store_true',
+                       help='Output raw cosine similarities without normalization')
     
     args = parser.parse_args()
     
-    # Validate input files exist
-    if not Path(args.ontology_file).exists():
-        raise FileNotFoundError(f"Ontology file not found: {args.ontology_file}")
+    # Get categories configuration
+    categories_config = get_categories_config(args.categories)
     
-    if not Path(args.universe_file).exists():
-        raise FileNotFoundError(f"Universe file not found: {args.universe_file}")
+    # Generate output filename if not provided
+    output_file = args.output
+    if not output_file:
+        output_file = generate_output_filename(categories_config, args.threshold, args.model)
     
-    # Select category set
-    if args.categories == 'no_geography':
-        categories = NO_GEOGRAPHY_CATEGORIES
-        config_name = "12cat_split_nogeo"
-    elif args.categories == 'original':
-        categories = ORIGINAL_8_CATEGORIES
-        config_name = "8cat_original"
-    elif args.categories == 'demo_independent':
-        categories = DEMOGRAPHICS_INDEPENDENT
-        config_name = "demo_independent"
-    elif args.categories == 'geography_only':
-        categories = GEOGRAPHY_ONLY_CATEGORIES
-        config_name = "1cat_geo_only"
-    else:
-        raise ValueError(f"Unknown category set: {args.categories}")
-    
-    # Set simplified output flag
-    global SIMPLIFIED_OUTPUT
-    SIMPLIFIED_OUTPUT = args.simplified
-    
-    # Auto-generate output filename if not provided
-    if not args.output:
-        base_name = Path(args.universe_file).stem
-        threshold_str = f"thresh{args.threshold}".replace(".", "p")
-        model_short = args.model.split('/')[-1].replace('-', '_')
-        args.output = f"{base_name}_{config_name}_{threshold_str}_{model_short}.json"
-        if args.simplified:
-            args.output = args.output.replace('.json', '_simplified.json')
-    
-    # Initialize and run extractor
-    extractor = CategoryWeightExtractor(
-        ontology_file=args.ontology_file,
-        universe_file=args.universe_file,
-        output_file=args.output,
-        categories=categories,
+    # Create extractor
+    extractor = ConceptWeightExtractor(
+        categories_config=categories_config,
+        threshold=args.threshold,
         model_name=args.model,
-        weight_threshold=args.threshold,
-        batch_size=args.batch_size,
-        embed_batch_size=args.embed_batch_size
+        embed_batch_size=args.embed_batch_size,
+        checkpoint_batch_size=args.checkpoint_batch_size,
+        simplified_output=args.simplified_output
     )
     
-    logger.info(f"🚀 Starting {len(categories)}-category weight extraction...")
-    logger.info(f"📁 Input ontology: {args.ontology_file}")
-    logger.info(f"📁 Input universe: {args.universe_file}")
-    logger.info(f"📁 Output file: {extractor.output_file}")
-    logger.info(f"🏷️  Category set: {args.categories} ({len(categories)} categories)")
-    logger.info(f"🤖 Model: {args.model}")
-    logger.info(f"🎯 Weight threshold: {args.threshold}")
-    logger.info(f"📦 Embed batch size: {args.embed_batch_size}")
-    logger.info(f"💾 Checkpoint batch size: {args.batch_size}")
-    logger.info(f"📄 Simplified output: {args.simplified}")
+    # Set raw scalars flag
+    extractor.raw_scalars = args.raw_scalars
     
-    start_time = time.time()
-    extractor.extract_weights()
-    end_time = time.time()
+    # Load universe data
+    universe_data = extractor._load_universe_data()
     
-    logger.info(f"⏱️  Total processing time: {end_time - start_time:.2f} seconds")
+    # Extract weights
+    results = extractor.extract_weights(universe_data)
+    
+    # Save results
+    logger.info(f"💾 Saving results to: {output_file}")
+    with open(output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    # Calculate and display statistics
+    if results:
+        # Calculate category distribution
+        category_counts = {}
+        total_variables = len(results)
+        
+        for result in results:
+            weights_key = 'category_weights' if args.simplified_output else 'category_weights_linear'
+            weights = result.get(weights_key, {})
+            
+            for category, weight in weights.items():
+                if category not in category_counts:
+                    category_counts[category] = 0
+                category_counts[category] += 1
+        
+        logger.info(f"\n📊 EXTRACTION SUMMARY ({len(categories_config['categories'])} CATEGORIES):")
+        logger.info(f"   Total variables processed: {total_variables:,}")
+        logger.info(f"   Categories used: {', '.join(categories_config['categories'])}")
+        logger.info(f"   Weight threshold applied: {args.threshold}")
+        
+        logger.info(f"\n🏷️  CATEGORY DISTRIBUTION:")
+        for category in sorted(category_counts.keys()):
+            count = category_counts[category]
+            percentage = (count / total_variables) * 100
+            logger.info(f"   {category}: {count:,} variables ({percentage:.1f}%)")
+    
+    logger.info(f"\n✅ Processing complete! Output saved to: {output_file}")
 
 if __name__ == "__main__":
     main()
