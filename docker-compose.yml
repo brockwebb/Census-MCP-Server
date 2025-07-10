@@ -5,27 +5,39 @@ services:
     build: .
     container_name: census-mcp-server
     environment:
+      # Census API key (required for data retrieval)
       - CENSUS_API_KEY=${CENSUS_API_KEY:-}
+      # Logging configuration
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-all-mpnet-base-v2}
+      # Vector database configuration (matches Dockerfile)
+      - VECTOR_DB_TYPE=chromadb
+      # Container detection
       - CENSUS_MCP_CONTAINER=true
+      # Python and R paths
       - PYTHONPATH=/app/src
       - R_EXECUTABLE=/usr/bin/Rscript
     volumes:
-      # Mount your pre-built vector DB
-      - ./data:/app/data
-      # Cache sentence transformer models
-      - census_models:/home/census/.cache/huggingface
+      # Cache sentence transformer models to avoid re-downloading
+      - census_models:/home/census/.cache/huggingface/transformers
+      # Cache sentence transformer hub models
+      - census_sentence_transformers:/home/census/.cache/torch/sentence_transformers
+    ports:
+      # Expose MCP server port if needed for external access
+      - "8000:8000"
     stdin_open: true
     tty: true
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import sys; sys.path.insert(0, '/app/src'); from utils.config import get_config; c = get_config(); print('OK')"]
+      # Test actual kb_search functionality with known query
+      test: ["CMD", "python", "-c", "from kb_search import search; exit(0 if search('median household income') else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 60s
 
 volumes:
+  # Persistent model cache volumes
   census_models:
+    driver: local
+  census_sentence_transformers:
     driver: local
